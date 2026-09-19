@@ -25,7 +25,7 @@ set -euo pipefail
 # Toggles - flip to false to skip a component
 # ---------------------------------------------------------------------------
 INSTALL_GHOSTTY=false
-INSTALL_XWAYLAND_SATELLITE=true   # X11-app compatibility for Umbriel; optional
+INSTALL_XWAYLAND_SATELLITE=false   # X11-app compatibility for Umbriel; optional
 INSTALL_BLUETOOTH=false
 
 ARCH="$(dpkg --print-architecture)"
@@ -48,6 +48,31 @@ write_config() {
   mv "$tmp" "$target"
 }
 
+# Tracks every package skipped anywhere in the run, so the final summary
+# can list them all in one place instead of them being buried in scrollback.
+SKIPPED_PACKAGES=()
+
+# Installs the given packages, skipping (with a warning) any that don't
+# exist / have no install candidate / fail for any other reason, rather
+# than letting one bad or renamed package name abort the whole script.
+# Tries the whole list as one apt transaction first (fast path - this is
+# what happens almost every time); only falls back to installing packages
+# one at a time - to isolate exactly which one is the problem - if that
+# fails.
+apt_install_lenient() {
+  if sudo apt install -y "$@"; then
+    return 0
+  fi
+  warn "Installing '$*' as a group failed; retrying one at a time to find which package is the problem..."
+  local pkg
+  for pkg in "$@"; do
+    if ! sudo apt install -y "$pkg"; then
+      warn "Skipping '$pkg' - no install candidate, or it failed to install. Continuing."
+      SKIPPED_PACKAGES+=("$pkg")
+    fi
+  done
+}
+
 if [ "$(id -u)" -eq 0 ]; then
   echo "Don't run this as root. Run it as your normal user (it calls sudo itself when needed)." >&2
   exit 1
@@ -63,7 +88,7 @@ log "Updating the base system"
 # ---------------------------------------------------------------------------
 sudo apt update
 sudo apt full-upgrade -y
-sudo apt install -y curl wget gnupg ca-certificates unzip
+apt_install_lenient curl wget gnupg ca-certificates unzip
 
 # If an earlier version of this script already ran here, it may have
 # dropped these into sources.list.d directly; the current version puts
@@ -153,7 +178,7 @@ sudo apt update
 # The linux-headers-$ARCH metapackage always tracks whatever kernel image
 # package is current, which is safer than pinning to `uname -r` right after
 # a full-upgrade (the running kernel may not be the newest installed one yet).
-sudo apt install -y "linux-headers-$ARCH" nvidia-driver firmware-misc-nonfree
+apt_install_lenient "linux-headers-$ARCH" nvidia-driver firmware-misc-nonfree
 
 # DRM kernel modesetting is required for any Wayland compositor (Umbriel
 # included) to drive the display through the NVIDIA driver.
@@ -243,19 +268,19 @@ EOF
 sudo apt update
 
 log "Installing Umbriel, Noctalia, the Umbriel portal backend, and the greeter"
-sudo apt install -y umbriel noctalia xdg-desktop-portal-umbriel noctalia-greeter
+apt_install_lenient umbriel noctalia xdg-desktop-portal-umbriel noctalia-greeter
 
 # ---------------------------------------------------------------------------
 log "Installing session plumbing: Xwayland, portals, audio, NetworkManager"
 # ---------------------------------------------------------------------------
-sudo apt install -y \
+apt_install_lenient \
   xwayland \
   xdg-desktop-portal xdg-desktop-portal-gtk \
   pipewire pipewire-audio pipewire-pulse wireplumber \
   network-manager
 
 if [ "$INSTALL_BLUETOOTH" = true ]; then
-  sudo apt install -y bluez
+  apt_install_lenient bluez
 fi
 
 sudo systemctl enable --now NetworkManager.service
@@ -266,7 +291,7 @@ warn "If /etc/network/interfaces still has a stanza for your wired/Wi-Fi" \
 
 # A fresh box with no firewall at all is worth locking down at least
 # minimally, even behind a home router. Adjust rules later with 'sudo ufw'.
-sudo apt install -y ufw
+apt_install_lenient ufw
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
 sudo ufw --force enable
@@ -281,30 +306,30 @@ if [ "$INSTALL_GHOSTTY" = true ]; then
   grep -qxF "$GHOSTTY_LINE" /etc/apt/sources.list 2>/dev/null || \
     echo "$GHOSTTY_LINE" | sudo tee -a /etc/apt/sources.list > /dev/null
   sudo apt update
-  sudo apt install -y ghostty
+  apt_install_lenient ghostty
   sudo update-alternatives --install /usr/bin/x-terminal-emulator x-terminal-emulator /usr/bin/ghostty 50 || true
 fi
 
 # ---------------------------------------------------------------------------
 log "Installing Nautilus and gvfs (trash, network shares, mounting)"
 # ---------------------------------------------------------------------------
-sudo apt install -y nautilus gvfs gvfs-backends gvfs-fuse
+apt_install_lenient nautilus gvfs gvfs-backends gvfs-fuse
 xdg-mime default org.gnome.Nautilus.desktop inode/directory 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 log "Installing grim + slurp (used by Noctalia's screenshot widget)"
 # ---------------------------------------------------------------------------
-sudo apt install -y grim slurp
+apt_install_lenient grim slurp
 
 # ---------------------------------------------------------------------------
 log "Installing clipboard backend and archive support"
 # ---------------------------------------------------------------------------
-sudo apt install -y wl-clipboard file-roller
+apt_install_lenient wl-clipboard file-roller
 
 # ---------------------------------------------------------------------------
 log "Installing printer support (CUPS)"
 # ---------------------------------------------------------------------------
-sudo apt install -y cups cups-pdf printer-driver-all system-config-printer avahi-daemon
+apt_install_lenient cups cups-pdf printer-driver-all system-config-printer avahi-daemon
 sudo systemctl enable --now cups.service avahi-daemon.service
 sudo usermod -aG lpadmin "$USER"
 warn "Printer admin group added - log out/in for it to take effect, then manage" \
@@ -314,12 +339,12 @@ warn "Printer admin group added - log out/in for it to take effect, then manage"
 # ---------------------------------------------------------------------------
 log "Installing git, OBS Studio (both in Debian's own repos)"
 # ---------------------------------------------------------------------------
-sudo apt install -y git obs-studio v4l2loopback-dkms jq
+apt_install_lenient git obs-studio v4l2loopback-dkms jq
 
 # ---------------------------------------------------------------------------
 log "Installing shell tools"
 # ---------------------------------------------------------------------------
-sudo apt install -y \
+apt_install_lenient \
   btop fzf tldr zoxide ripgrep eza fd-find bat fastfetch starship
 
 # Debian renames two of these to avoid clashing with older packages that
@@ -372,7 +397,7 @@ log "Installing Zed (official install script - Zed has no APT package)"
 curl -f https://zed.dev/install.sh | sh
 
 sudo apt update
-sudo apt install -y firefox
+apt_install_lenient firefox
 
 # ---------------------------------------------------------------------------
 log "Installing Obsidian (no APT repo; official .deb from GitHub releases)"
@@ -381,7 +406,7 @@ OBSIDIAN_DEB_URL="$(curl -fsSL https://api.github.com/repos/obsidianmd/obsidian-
   | jq -r '.assets[] | select(.name | test("_amd64\\.deb$")) | .browser_download_url')"
 if [ -n "${OBSIDIAN_DEB_URL:-}" ]; then
   curl -fsSL -o /tmp/obsidian.deb "$OBSIDIAN_DEB_URL"
-  sudo apt install -y /tmp/obsidian.deb
+  apt_install_lenient /tmp/obsidian.deb
 else
   warn "Couldn't auto-detect the latest Obsidian .deb; get it from https://obsidian.md/download"
 fi
@@ -390,14 +415,14 @@ fi
 log "Installing Discord (no APT repo; official .deb from Discord's own endpoint)"
 # ---------------------------------------------------------------------------
 curl -fsSL -o /tmp/discord.deb "https://discord.com/api/download?platform=linux&format=deb"
-sudo apt install -y /tmp/discord.deb
+apt_install_lenient /tmp/discord.deb
 
 # ---------------------------------------------------------------------------
 if [ "$INSTALL_XWAYLAND_SATELLITE" = true ]; then
   log "Building xwayland-satellite (Xwayland/X11-app support for Umbriel)"
   # Not packaged for Debian; official Umbriel dependency, built from source.
   # https://github.com/Supreeeme/xwayland-satellite
-  sudo apt install -y cargo rustc clang pkg-config libxcb1-dev libxcb-cursor-dev
+  apt_install_lenient cargo rustc clang pkg-config libxcb1-dev libxcb-cursor-dev
   if ! command -v xwayland-satellite >/dev/null 2>&1; then
     cargo install --locked xwayland-satellite --root "$HOME/.local"
   fi
@@ -506,6 +531,16 @@ EOF
 
 # ---------------------------------------------------------------------------
 log "Done."
+
+if [ "${#SKIPPED_PACKAGES[@]}" -gt 0 ]; then
+  warn "Some packages were skipped (no install candidate, or they failed to" \
+       "install) and everything else proceeded anyway: ${SKIPPED_PACKAGES[*]}" \
+       "Check above for exactly why, and install/replace them by hand if you" \
+       "need what they provide - e.g. cups-pdf specifically has been dropped" \
+       "from Debian's repos; 'Print to File (PDF)' in most apps' native print" \
+       "dialog covers the same need without it."
+fi
+
 cat <<'EOF'
 
 Next steps:
