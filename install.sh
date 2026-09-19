@@ -24,7 +24,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Toggles - flip to false to skip a component
 # ---------------------------------------------------------------------------
-INSTALL_GHOSTTY=true
+INSTALL_GHOSTTY=false
 INSTALL_XWAYLAND_SATELLITE=true   # X11-app compatibility for Umbriel; optional
 INSTALL_BLUETOOTH=false
 
@@ -32,6 +32,21 @@ ARCH="$(dpkg --print-architecture)"
 
 log()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 warn() { printf '\n\033[1;33m!! %s\033[0m\n' "$*"; }
+
+# Writes stdin to $1. If a file is already there with different content
+# (a previous run, or a hand-edit), it's backed up to "$1.bak" first rather
+# than silently discarded - so re-running to pick up a script update never
+# destroys anything, it just archives the last version. If the content is
+# identical to what's already there, this is a no-op (no needless .bak).
+write_config() {
+  local target="$1" tmp
+  tmp="$(mktemp)"
+  cat > "$tmp"
+  if [ -f "$target" ] && ! cmp -s "$target" "$tmp"; then
+    cp "$target" "$target.bak"
+  fi
+  mv "$tmp" "$target"
+}
 
 if [ "$(id -u)" -eq 0 ]; then
   echo "Don't run this as root. Run it as your normal user (it calls sudo itself when needed)." >&2
@@ -49,6 +64,14 @@ log "Updating the base system"
 sudo apt update
 sudo apt full-upgrade -y
 sudo apt install -y curl wget gnupg ca-certificates unzip
+
+# If an earlier version of this script already ran here, it may have
+# dropped these into sources.list.d directly; the current version puts
+# everything in /etc/apt/sources.list instead, and a leftover file here
+# would make apt see the same repo twice ("configured multiple times").
+sudo rm -f /etc/apt/sources.list.d/noctalia-trixie.sources \
+           /etc/apt/sources.list.d/home_clayrisser_sid.sources \
+           /etc/apt/sources.list.d/mozilla.sources
 
 # ---------------------------------------------------------------------------
 log "Enabling contrib/non-free/non-free-firmware and installing the NVIDIA driver"
@@ -92,13 +115,16 @@ add_missing_components_legacy() {
 }
 
 if [ -f "$LEGACY_SOURCES" ] && grep -Eq '^[[:space:]]*deb(-src)?[[:space:]]' "$LEGACY_SOURCES"; then
-  sudo cp "$LEGACY_SOURCES" "$LEGACY_SOURCES.bak"
+  # Only ever back up the *first* time - a re-run's .bak should still be
+  # the state before this script ever touched the file, not before its
+  # own previous run.
+  [ -f "$LEGACY_SOURCES.bak" ] || sudo cp "$LEGACY_SOURCES" "$LEGACY_SOURCES.bak"
   add_missing_components_legacy "$LEGACY_SOURCES" | sudo tee "$LEGACY_SOURCES.new" > /dev/null
   sudo mv "$LEGACY_SOURCES.new" "$LEGACY_SOURCES"
 elif [ -f "$DEB822_SOURCES" ]; then
   # Fallback for systems already on DEB822 (apt modernize-sources, cloud
   # images) - same idea, applied to Components: lines instead.
-  sudo cp "$DEB822_SOURCES" "$DEB822_SOURCES.bak"
+  [ -f "$DEB822_SOURCES.bak" ] || sudo cp "$DEB822_SOURCES" "$DEB822_SOURCES.bak"
   awk '
     /^Components:/ {
       have_contrib=0; have_nonfree=0; have_nonfreefw=0
@@ -143,11 +169,13 @@ sudo update-initramfs -u
 # of this. Uncomment one at a time only if you hit cursor glitches or apps
 # failing to start.
 mkdir -p "$HOME/.config/environment.d"
+if [ ! -f "$HOME/.config/environment.d/nvidia.conf" ]; then
 cat > "$HOME/.config/environment.d/nvidia.conf" << 'EOF'
 #WLR_NO_HARDWARE_CURSORS=1
 #__GLX_VENDOR_LIBRARY_NAME=nvidia
 #LIBVA_DRIVER_NAME=nvidia
 EOF
+fi
 warn "NVIDIA driver installed - a REBOOT is required before Umbriel will start" \
      "correctly (the kernel needs to load with nvidia-drm.modeset=1 active)."
 
@@ -180,7 +208,17 @@ else
   NOCT_OPTS=""
   [ -n "$NOCT_SIGNED_BY" ] && NOCT_OPTS="[signed-by=$NOCT_SIGNED_BY] "
   for suite in $NOCT_SUITES; do
-    NOCT_LINE="deb ${NOCT_OPTS}${NOCT_URI} ${suite} ${NOCT_COMPONENTS}"
+    # A suite ending in "/" is an "absolute" reference in legacy one-line
+    # format (Noctalia's own suites do this - visible as the trailing "/"
+    # in apt's "Hit: ... trixie/ InRelease" output) - and apt flatly
+    # refuses to parse an absolute suite combined with any components
+    # ("Malformed entry ... (absolute Suite Component)"), even though
+    # that combination is valid in their source DEB822 file. So: no
+    # components appended for those, same as a flat repo.
+    case "$suite" in
+      */) NOCT_LINE="deb ${NOCT_OPTS}${NOCT_URI} ${suite}" ;;
+      *)  NOCT_LINE="deb ${NOCT_OPTS}${NOCT_URI} ${suite} ${NOCT_COMPONENTS}" ;;
+    esac
     grep -qxF "$NOCT_LINE" /etc/apt/sources.list 2>/dev/null || \
       echo "$NOCT_LINE" | sudo tee -a /etc/apt/sources.list > /dev/null
   done
@@ -386,7 +424,7 @@ sudo systemctl restart greetd.service 2>/dev/null || true
 log "Writing Umbriel config (~/.config/umbriel/config.toml)"
 # ---------------------------------------------------------------------------
 mkdir -p "$HOME/.config/umbriel"
-cat > "$HOME/.config/umbriel/config.toml" << 'EOF'
+write_config "$HOME/.config/umbriel/config.toml" << 'EOF'
 [general]
 autostart = ["noctalia"]
 # mod_key defaults to Super; change here if you want Alt instead.
@@ -405,9 +443,6 @@ noise = 0.02
 brightness = 0.9
 contrast = 0.9
 saturation = 1.1
-
-[shell]
-umbriel_overview_type_to_launch_enabled = true
 
 # --- window rules ---
 [[window_rule]]
@@ -448,23 +483,26 @@ EOF
 log "Writing Noctalia config (~/.config/noctalia/config.toml)"
 # ---------------------------------------------------------------------------
 mkdir -p "$HOME/.config/noctalia"
-cat > "$HOME/.config/noctalia/config.toml" << 'EOF'
+write_config "$HOME/.config/noctalia/config.toml" << 'EOF'
 [shell]
 font_family = "RobotoMono Nerd Font"
 # Native polkit agent: safe to enable since no other agent is installed.
 polkit_agent = true
+# Lets typing in Umbriel's overview open Noctalia's launcher pre-filled -
+# this Noctalia-side setting name is prefixed per-compositor (Niri's
+# equivalent is niri_overview_type_to_launch_enabled); it does NOT belong
+# in umbriel/config.toml, which has no [shell] section at all.
+umbriel_overview_type_to_launch_enabled = true
 EOF
 
 # ---------------------------------------------------------------------------
 log "Writing Ghostty config (~/.config/ghostty/config)"
 # ---------------------------------------------------------------------------
 mkdir -p "$HOME/.config/ghostty"
-if [ ! -f "$HOME/.config/ghostty/config" ]; then
-cat > "$HOME/.config/ghostty/config" << 'EOF'
+write_config "$HOME/.config/ghostty/config" << 'EOF'
 font-family = RobotoMono Nerd Font
 window-decoration = false
 EOF
-fi
 
 # ---------------------------------------------------------------------------
 log "Done."
