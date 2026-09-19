@@ -53,15 +53,52 @@ sudo apt install -y curl wget gnupg ca-certificates unzip
 # ---------------------------------------------------------------------------
 log "Enabling contrib/non-free/non-free-firmware and installing the NVIDIA driver"
 # ---------------------------------------------------------------------------
-# Debian's installer enables non-free-firmware by default but not contrib or
-# non-free, and nvidia-driver lives in non-free. Rather than layer a second
-# sources file on top (which would re-declare non-free-firmware and make
-# apt fail with a "configured multiple times" error), this edits the
-# existing Components: line(s) in place, only adding what's missing, and
-# keeps a .bak copy first.
-DEBIAN_SOURCES="/etc/apt/sources.list.d/debian.sources"
-if [ -f "$DEBIAN_SOURCES" ]; then
-  sudo cp "$DEBIAN_SOURCES" "$DEBIAN_SOURCES.bak"
+# A real Debian 13 netinstall configures apt via the legacy
+# /etc/apt/sources.list, not a DEB822 sources.list.d/debian.sources file
+# (that file only shows up on cloud images, or after `apt
+# modernize-sources`) - so that's the primary target here, edited in place
+# rather than laying a second file on top (which risks apt's "configured
+# multiple times" error if a component is re-declared). Only whichever of
+# contrib/non-free/non-free-firmware is missing gets appended to each
+# existing deb/deb-src line; everything else about the file is untouched.
+# A .bak copy is kept first either way.
+LEGACY_SOURCES="/etc/apt/sources.list"
+DEB822_SOURCES="/etc/apt/sources.list.d/debian.sources"
+
+add_missing_components_legacy() {
+  awk '
+    /^[[:space:]]*#/ || !/^[[:space:]]*deb(-src)?[[:space:]]/ { print; next }
+    {
+      n = split($0, tok, " ")
+      i = 2
+      if (tok[i] ~ /^\[/) {
+        while (i <= n && tok[i] !~ /\]$/) i++
+        i++
+      }
+      # tok[i] = URI, tok[i+1] = suite, tok[i+2..n] = components
+      have_contrib=0; have_nonfree=0; have_nonfreefw=0
+      for (j = i+2; j <= n; j++) {
+        if (tok[j] == "contrib") have_contrib = 1
+        if (tok[j] == "non-free") have_nonfree = 1
+        if (tok[j] == "non-free-firmware") have_nonfreefw = 1
+      }
+      line = $0
+      if (!have_contrib)   line = line " contrib"
+      if (!have_nonfree)   line = line " non-free"
+      if (!have_nonfreefw) line = line " non-free-firmware"
+      print line
+    }
+  ' "$1"
+}
+
+if [ -f "$LEGACY_SOURCES" ] && grep -Eq '^[[:space:]]*deb(-src)?[[:space:]]' "$LEGACY_SOURCES"; then
+  sudo cp "$LEGACY_SOURCES" "$LEGACY_SOURCES.bak"
+  add_missing_components_legacy "$LEGACY_SOURCES" | sudo tee "$LEGACY_SOURCES.new" > /dev/null
+  sudo mv "$LEGACY_SOURCES.new" "$LEGACY_SOURCES"
+elif [ -f "$DEB822_SOURCES" ]; then
+  # Fallback for systems already on DEB822 (apt modernize-sources, cloud
+  # images) - same idea, applied to Components: lines instead.
+  sudo cp "$DEB822_SOURCES" "$DEB822_SOURCES.bak"
   awk '
     /^Components:/ {
       have_contrib=0; have_nonfree=0; have_nonfreefw=0
@@ -78,11 +115,11 @@ if [ -f "$DEBIAN_SOURCES" ]; then
       next
     }
     { print }
-  ' "$DEBIAN_SOURCES" | sudo tee "$DEBIAN_SOURCES.new" > /dev/null
-  sudo mv "$DEBIAN_SOURCES.new" "$DEBIAN_SOURCES"
+  ' "$DEB822_SOURCES" | sudo tee "$DEB822_SOURCES.new" > /dev/null
+  sudo mv "$DEB822_SOURCES.new" "$DEB822_SOURCES"
 else
-  warn "Couldn't find $DEBIAN_SOURCES (old-style /etc/apt/sources.list install?)." \
-       "Add 'contrib non-free non-free-firmware' to your main entry by hand," \
+  warn "Couldn't find $LEGACY_SOURCES or $DEB822_SOURCES." \
+       "Add 'contrib non-free non-free-firmware' to your apt sources by hand," \
        "then re-run this script, or just install nvidia-driver manually."
 fi
 sudo apt update
@@ -120,8 +157,51 @@ log "Adding the Noctalia APT repository (Noctalia, Umbriel, Greeter, portal)"
 # Official repo per https://docs.noctalia.dev/noctalia/getting-started/installation/
 wget -q https://pkg.noctalia.dev/deb/nickh-archive-keyring.deb -O /tmp/nickh-archive-keyring.deb
 sudo dpkg -i /tmp/nickh-archive-keyring.deb
-sudo wget -q -O /etc/apt/sources.list.d/noctalia-trixie.sources \
-  https://pkg.noctalia.dev/deb/noctalia-trixie.sources
+
+# Noctalia publish a DEB822 .sources file; rather than drop it as-is into
+# sources.list.d, parse its fields and append the equivalent plain deb
+# line(s) to /etc/apt/sources.list instead. Its Suites: field can list more
+# than one suite (their repo currently bundles a self-hosted
+# "trixie-backports" alongside "trixie" - see the pin note below), and
+# legacy format only takes one suite per line, so each becomes its own line.
+NOCT_TMP="/tmp/noctalia-trixie.sources"
+wget -q https://pkg.noctalia.dev/deb/noctalia-trixie.sources -O "$NOCT_TMP"
+
+NOCT_URI=$(sed -n 's/^URIs:[[:space:]]*//p' "$NOCT_TMP" | head -1)
+NOCT_SUITES=$(sed -n 's/^Suites:[[:space:]]*//p' "$NOCT_TMP" | head -1)
+NOCT_COMPONENTS=$(sed -n 's/^Components:[[:space:]]*//p' "$NOCT_TMP" | head -1)
+NOCT_SIGNED_BY=$(sed -n 's/^Signed-By:[[:space:]]*//p' "$NOCT_TMP" | head -1)
+
+if [ -z "$NOCT_URI" ] || [ -z "$NOCT_SUITES" ]; then
+  warn "Couldn't parse noctalia-trixie.sources; falling back to dropping it" \
+       "into sources.list.d unchanged."
+  sudo mv "$NOCT_TMP" /etc/apt/sources.list.d/noctalia-trixie.sources
+else
+  NOCT_OPTS=""
+  [ -n "$NOCT_SIGNED_BY" ] && NOCT_OPTS="[signed-by=$NOCT_SIGNED_BY] "
+  for suite in $NOCT_SUITES; do
+    NOCT_LINE="deb ${NOCT_OPTS}${NOCT_URI} ${suite} ${NOCT_COMPONENTS}"
+    grep -qxF "$NOCT_LINE" /etc/apt/sources.list 2>/dev/null || \
+      echo "$NOCT_LINE" | sudo tee -a /etc/apt/sources.list > /dev/null
+  done
+  rm -f "$NOCT_TMP"
+fi
+
+# Noctalia's repo bundles a self-hosted "trixie-backports" suite alongside
+# "trixie" (needed because current Umbriel/Noctalia builds require a newer
+# wlroots than stock Trixie's libdrm2/libwayland/libxkbcommon can satisfy).
+# Like real backports, that suite defaults to NotAutomatic, so apt's solver
+# won't auto-select the newer libs even though umbriel hard-depends on them
+# - producing a "held broken packages" conflict on plain `apt install`.
+# Known upstream issue: https://github.com/noctalia-dev/noctalia-greeter/issues/108
+# Pinning by hostname (not suite name) avoids ever touching Debian's own
+# official trixie-backports if that's enabled separately.
+sudo tee /etc/apt/preferences.d/noctalia > /dev/null <<'EOF'
+Package: *
+Pin: origin "pkg.noctalia.dev"
+Pin-Priority: 500
+EOF
+
 sudo apt update
 
 log "Installing Umbriel, Noctalia, the Umbriel portal backend, and the greeter"
@@ -159,13 +239,9 @@ if [ "$INSTALL_GHOSTTY" = true ]; then
   # https://github.com/clayrisser/debian-ghostty - trixie uses the sid/unstable channel
   curl -fsSL https://download.opensuse.org/repositories/home:clayrisser:sid/Debian_Unstable/Release.key \
     | gpg --dearmor | sudo tee /etc/apt/keyrings/home_clayrisser_sid.gpg > /dev/null
-  sudo tee /etc/apt/sources.list.d/home_clayrisser_sid.sources > /dev/null <<EOF
-Types: deb
-URIs: http://download.opensuse.org/repositories/home:/clayrisser:/sid/Debian_Unstable/
-Suites: /
-Architectures: $ARCH
-Signed-By: /etc/apt/keyrings/home_clayrisser_sid.gpg
-EOF
+  GHOSTTY_LINE="deb [arch=$ARCH signed-by=/etc/apt/keyrings/home_clayrisser_sid.gpg] http://download.opensuse.org/repositories/home:/clayrisser:/sid/Debian_Unstable/ ./"
+  grep -qxF "$GHOSTTY_LINE" /etc/apt/sources.list 2>/dev/null || \
+    echo "$GHOSTTY_LINE" | sudo tee -a /etc/apt/sources.list > /dev/null
   sudo apt update
   sudo apt install -y ghostty
   sudo update-alternatives --install /usr/bin/x-terminal-emulator x-terminal-emulator /usr/bin/ghostty 50 || true
@@ -240,13 +316,9 @@ log "Adding Mozilla's official APT repo and installing Firefox"
 sudo install -d -m 0755 /etc/apt/keyrings
 wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O- \
   | sudo tee /etc/apt/keyrings/packages.mozilla.org.asc > /dev/null
-sudo tee /etc/apt/sources.list.d/mozilla.sources > /dev/null <<EOF
-Types: deb
-URIs: https://packages.mozilla.org/apt
-Suites: mozilla
-Components: main
-Signed-By: /etc/apt/keyrings/packages.mozilla.org.asc
-EOF
+MOZILLA_LINE="deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main"
+grep -qxF "$MOZILLA_LINE" /etc/apt/sources.list 2>/dev/null || \
+  echo "$MOZILLA_LINE" | sudo tee -a /etc/apt/sources.list > /dev/null
 sudo tee /etc/apt/preferences.d/mozilla > /dev/null <<'EOF'
 Package: *
 Pin: origin packages.mozilla.org
